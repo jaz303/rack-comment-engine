@@ -7,7 +7,13 @@ class CommentEngine
   attr_reader :options
   
   def initialize(app, options = {})
-    @app, @options = app, {:base => '/comments'}.update(options)
+    @app = app
+    @options = {
+      :base => '/comments',
+      :email_required => true,
+      :name_required => true,
+      :auto_approve => true
+    }.update(options)
   end
   
   def call(env)
@@ -45,12 +51,28 @@ private
     [405, {"Content-Type" => "text/plain"}, "405 Method Not Allowed"]
   end
   
+  def json_error(obj)
+    [500, {"Content-Type" => "application/json"}, obj.to_json]
+  end
+  
   def json_ok(obj)
     [200, {"Content-Type" => "application/json"}, obj.to_json]
   end
 
   def base
     @options[:base]
+  end
+  
+  def name_required?
+    !! @options[:name_required]
+  end
+  
+  def email_required?
+    !! @options[:email_required]
+  end
+  
+  def auto_approve?
+    !! @options[:auto_approve]
   end
 
   def db
@@ -123,7 +145,7 @@ private
     else
       row['comments'] = db.execute <<-SQL
         SELECT
-          author_name, author_email, body, created_at
+          author_name, body, created_at
         FROM
           comment
         WHERE
@@ -144,8 +166,38 @@ private
     if row.nil?
       not_found
     else
-      p params
-      # TODO: create comment
+      errors = {}
+      
+      author_name     = (params[:author_name] || '').to_s.strip
+      author_email    = (params[:author_email] || '').to_s.strip
+      body            = (params[:body] || '').to_s.strip
+      
+      if name_required? && author_name.length == 0
+        errors['author_name'] = 'cannot be blank'
+      end
+      
+      if author_email.length == 0
+        if email_required?
+          errors['author_email'] = 'cannot be blank'
+        end
+      elsif author_email !~ /^[^ @]+@[a-z0-9-]+(\.[a-z0-9-]+)+$/i
+        errors['author_email'] = 'is not valid'
+      end
+      
+      errors['body'] = 'cannot be blank' if body.length == 0
+      errors['thread'] = 'is closed' if row['closed']
+      
+      if errors.empty?
+        db.execute <<-SQL
+          INSERT INTO comment
+            (comment_thread_id, author_name, author_email, body, hidden)
+          VALUES
+            (#{row['id'].to_i}, '#{q(author_name)}', '#{q(author_email)}', '#{q(body)}', #{auto_approve? ? 0 : 1})
+        SQL
+        json_ok([true])
+      else
+        json_error(errors)
+      end
     end
   end
   
@@ -156,7 +208,10 @@ private
     else
       res = db.get_first_row("SELECT * FROM comment_thread WHERE slug = '#{q(thread_id)}'")
     end
-    treat!(res) unless res.nil?
+    unless res.nil?
+      treat!(res)
+      res['closed'] = true if res['auto_closes_at'] && (Time.now > res['auto_closes_at'])
+    end
     res
   end
   
